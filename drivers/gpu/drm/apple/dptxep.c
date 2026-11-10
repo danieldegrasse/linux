@@ -109,6 +109,10 @@ int dptxport_connect(struct apple_epic_service *service, u8 core, u8 atc,
 		     FIELD_PREP(DCPDPTX_REMOTE_PORT_DIE, die) |
 		     DCPDPTX_REMOTE_PORT_CONNECTED;
 
+	if (core == 1) {
+		unk_field = 0xc80a0101;
+	}
+
 	trace_dptxport_connect(dptx, core, atc, die);
 
 	cmd.target = cpu_to_le32(target);

@@ -357,7 +357,7 @@ int dcp_get_connector_type(struct platform_device *pdev)
 
 #define DPTX_CONNECT_TIMEOUT msecs_to_jiffies(2000)
 
-static int dcp_dptx_connect(struct apple_dcp *dcp, u32 port)
+static int dcp_dptx_connect(struct apple_dcp *dcp, u32 port, u32 core)
 {
 	int ret = 0;
 
@@ -379,7 +379,7 @@ static int dcp_dptx_connect(struct apple_dcp *dcp, u32 port)
 
 	reinit_completion(&dcp->dptxport[port].linkcfg_completion);
 	dcp->dptxport[port].atcphy = dcp->phy;
-	dptxport_connect(dcp->dptxport[port].service, 0, dcp->dptx_phy, dcp->dptx_die);
+	dptxport_connect(dcp->dptxport[port].service, core, dcp->dptx_phy, dcp->dptx_die);
 	dptxport_request_display(dcp->dptxport[port].service);
 	dcp->dptxport[port].connected = true;
 
@@ -395,8 +395,10 @@ static int dcp_dptx_connect(struct apple_dcp *dcp, u32 port)
 
 	usleep_range(5, 10);
 
-	if (dcp->connector_type == DRM_MODE_CONNECTOR_DisplayPort)
+	if (dcp->connector_type == DRM_MODE_CONNECTOR_DisplayPort || core == 1) {
+		printk("Setting hotplug detect!\n");
 		dptxport_set_hpd(dcp->dptxport[port].service, true);
+	}
 
 	if (dcp->avep)
 		av_service_connect(dcp);
@@ -433,7 +435,7 @@ static int dcp_dptx_disconnect(struct apple_dcp *dcp, u32 port)
 int dcp_dptx_connect_oob(struct platform_device *pdev, u32 port)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
-	return dcp_dptx_connect(dcp, port);
+	return dcp_dptx_connect(dcp, port, 1);
 }
 
 int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port)
@@ -471,7 +473,7 @@ static irqreturn_t dcp_dp2hdmi_hpd(int irq, void *data)
 	}
 
 	if (connected)
-		dcp_dptx_connect(dcp, 0);
+		dcp_dptx_connect(dcp, 0, 0);
 
 	return IRQ_HANDLED;
 }
@@ -550,7 +552,7 @@ int dcp_start(struct platform_device *pdev)
 
 			// necessary on j473/j474 but not on j314c
 			if (connected)
-				dcp_dptx_connect(dcp, 0);
+				dcp_dptx_connect(dcp, 0, 0);
 #endif
 		}
 	} else if (dcp->phy) {
@@ -598,7 +600,7 @@ static int dcp_enable_dp2hdmi_hpd(struct apple_dcp *dcp)
 		dev_info(dcp->dev, "%s: DP2HDMI HPD connected:%d\n", __func__, connected);
 
 		if (connected)
-			dcp_dptx_connect(dcp, 0);
+			dcp_dptx_connect(dcp, 0, 0);
 		else
 			_dcp_poweroff(dcp);
 	}
@@ -661,7 +663,7 @@ void dcp_poweron(struct platform_device *pdev)
 		dev_info(dcp->dev, "%s: DP2HDMI HPD connected:%d\n", __func__, connected);
 
 		if (connected)
-			dcp_dptx_connect(dcp, 0);
+			dcp_dptx_connect(dcp, 0, 0);
 	}
 
 	switch (dcp->fw_compat) {
