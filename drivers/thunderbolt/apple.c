@@ -97,6 +97,8 @@
 #include <linux/usb/typec_mux.h>
 #include <linux/usb/typec_tbt.h>
 
+#include <drm/drm_connector.h>
+
 #include "nhi.h"
 #include "tb.h"
 
@@ -140,6 +142,9 @@
 #define TB_VSE_CAP_APPLE_CABLE_INFO_LEGACY_ADAPTER BIT(9)
 #define TB_VSE_CAP_APPLE_CABLE_INFO_TBT2_3 BIT(10)
 
+/* Interval to poll DPIN for changes, in ms */
+#define DPIN_POLL_INTERVAL_MS 1000
+
 /**
  * struct apple_cio - Apple Converged I/O host router complex
  * @dev: ACIO device
@@ -170,6 +175,11 @@ struct apple_cio {
 
 	struct resource *sram_res;
 	void __iomem *sram_base;
+
+	struct resource *dpin_res;
+	void __iomem *dpin_base;
+	struct delayed_work dpin_work;
+	struct fwnode_handle *connector_fwnode;
 
 	struct reset_control *reset;
 
@@ -687,6 +697,104 @@ static void apple_cio_stop(struct apple_cio *acio)
 	acio->current_cable_info = 0;
 }
 
+#define DPIN_HPD_LEVEL_STATUS	0x00
+#define DPIN_HPD_PLUG		BIT(0)
+#define DPIN_HPD_UNPLUG		BIT(1)
+#define DPIN_HPD_LEVEL		BIT(2)
+
+#define DPIN_IRQ_STATUS		0x04
+#define DPIN_IRQ_ENABLE		0x08
+#define DPIN_IRQ_HPD_LEVEL	BIT(0)
+#define DPIN_IRQ_HPD_PLUG	BIT(1)
+
+
+#define DPIN_CTRL		0x0c
+#define DPIN_CTRL_DPTX_ACTIVE BIT(0)
+
+#define DPIN_STATUS			0x10
+#define DPIN_STATUS_DPTX_ACTIVE_ACK	BIT(0)
+#define DPIN1_OFF 0x8000
+
+#define DPIN_TIMEOUT_US 10000000
+
+/**
+ * apple_cio_dpin_work - Poll DPIN peripheral for DP status
+ * @work: work_struct within ACIO context
+ *
+ * This work function polls the DPIN peripheral periodically to determine
+ * if a DP cable has been connected, and if so issues a notification to the DCP
+ */
+static void apple_cio_dpin_work(struct work_struct *work)
+{
+	struct delayed_work *dwork = to_delayed_work(work);
+	struct apple_cio *acio = container_of(dwork, struct apple_cio, dpin_work);
+	dev_info(acio->dev, "Starting DPIN work\n");
+	int ret;
+	u32 dpin_reg;
+	bool event = false;
+	bool connected = false;
+
+	for (int i = 0; i < 2; i ++) {
+		dpin_reg = readl(acio->dpin_base + DPIN_HPD_LEVEL_STATUS + i * DPIN1_OFF);
+		dev_info(acio->dev, "DPIN%d status was %08X\n", i, dpin_reg);
+		if (dpin_reg & DPIN_HPD_PLUG) {
+			/* Setup dpin */
+			dpin_reg = readl(acio->dpin_base + DPIN_CTRL + i * DPIN1_OFF);
+			dev_info(acio->dev, "DPIN%d ctrl was %08X\n", i, dpin_reg);
+			writel(0x3, acio->dpin_base + DPIN_IRQ_ENABLE + i * DPIN1_OFF);
+			ret = readl_poll_timeout(acio->dpin_base + DPIN_IRQ_STATUS + i * DPIN1_OFF,
+						 dpin_reg, (dpin_reg == DPIN_IRQ_HPD_LEVEL), 10, DPIN_TIMEOUT_US);
+			if (ret != 0) {
+				dev_err(acio->dev, "DPIN%d IRQ level did not assert: %d\n", i, ret);
+				return;
+			}
+			writel(DPIN_IRQ_HPD_LEVEL, acio->dpin_base + DPIN_IRQ_STATUS + i * DPIN1_OFF);
+			writel(DPIN_HPD_PLUG | DPIN_HPD_LEVEL,
+			       acio->dpin_base + DPIN_HPD_LEVEL_STATUS + i * DPIN1_OFF);
+			writel(0x0, acio->dpin_base + DPIN_CTRL + i * DPIN1_OFF);
+			ret = readl_poll_timeout(acio->dpin_base + DPIN_STATUS + i * DPIN1_OFF,
+						 dpin_reg, (dpin_reg == 0), 10, DPIN_TIMEOUT_US);
+			if (ret != 0) {
+				dev_err(acio->dev, "DPIN%d_STATUS did not clear: %d\n", i, ret);
+				return;
+			}
+			ret = readl_poll_timeout(acio->dpin_base + DPIN_HPD_LEVEL_STATUS + i * DPIN1_OFF,
+						 dpin_reg, (dpin_reg == 0x4), 10, DPIN_TIMEOUT_US);
+			if (ret != 0) {
+				dev_err(acio->dev, "DPIN%d_HPD_LEVEL_STATUS did not move to level: %d\n", i, ret);
+				return;
+			}
+			event = true;
+			connected = true;
+		}
+
+		if (dpin_reg & DPIN_HPD_UNPLUG) {
+			/* Teardown dpin */
+			dpin_reg = readl(acio->dpin_base + DPIN_CTRL + i * DPIN1_OFF);
+			dev_info(acio->dev, "DPIN%d ctrl was %08X\n", i, dpin_reg);
+			writel(0x1, acio->dpin_base + DPIN_CTRL + i * DPIN1_OFF);
+			ret = readl_poll_timeout(acio->dpin_base + DPIN_STATUS + i * DPIN1_OFF,
+						 dpin_reg, (dpin_reg == 0), 10, DPIN_TIMEOUT_US);
+			if (ret != 0) {
+				dev_err(acio->dev, "DPIN%d_STATUS did not clear: %d\n", i, ret);
+				return;
+			}
+			event = true;
+			connected = false;
+		}
+	}
+
+
+	if (event && (acio->connector_fwnode != NULL)) {
+		drm_connector_oob_hotplug_event(acio->connector_fwnode,
+						connected ? connector_status_connected :
+						connector_status_disconnected);
+	}
+
+	schedule_delayed_work(&acio->dpin_work, msecs_to_jiffies(DPIN_POLL_INTERVAL_MS));
+}
+
+
 /**
  * apple_cio_start - Power up and start the ACIO complex
  * @acio: ACIO complex to start
@@ -771,6 +879,12 @@ static int apple_cio_start(struct apple_cio *acio)
 	if (acio->nhi_boot_status) {
 		ret = acio->nhi_boot_status;
 		goto err_depopulate;
+	}
+
+	if (acio->dpin_res) {
+		/* Start DPIN service */
+		schedule_delayed_work(&acio->dpin_work,
+				      msecs_to_jiffies(DPIN_POLL_INTERVAL_MS));
 	}
 
 	acio->current_cable_info = acio->target_cable_info;
@@ -876,6 +990,7 @@ static int apple_cio_tbt_switch_set(struct typec_thunderbolt_switch_dev *sw,
 	if (acio->target_cable_info)
 		return apple_cio_start(acio);
 
+	cancel_delayed_work_sync(&acio->dpin_work);
 	apple_cio_stop(acio);
 	return 0;
 }
@@ -884,6 +999,8 @@ static int apple_cio_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct apple_cio *acio;
+	struct fwnode_handle *fwnode = dev_fwnode(dev);
+	struct fwnode_handle *connector_fwnode = NULL;
 	int ret;
 
 	acio = devm_kzalloc(dev, sizeof(*acio), GFP_KERNEL);
@@ -904,6 +1021,20 @@ static int apple_cio_probe(struct platform_device *pdev)
 	acio->sram_base = devm_ioremap_resource(dev, acio->sram_res);
 	if (IS_ERR(acio->sram_base))
 		return dev_err_probe(dev, PTR_ERR(acio->sram_base), "Failed to map SRAM\n");
+
+	acio->dpin_res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "dpin");
+	if (acio->dpin_res) {
+		acio->dpin_base = devm_ioremap_resource(dev, acio->dpin_res);
+		if (IS_ERR(acio->dpin_base)) {
+			return dev_err_probe(dev, PTR_ERR(acio->sram_base), "Failed to map DPIN\n");
+		}
+		INIT_DELAYED_WORK(&acio->dpin_work, apple_cio_dpin_work);
+	}
+
+	if (fwnode_property_present(fwnode, "dcp"))
+		connector_fwnode = fwnode_find_reference(fwnode, "dcp", 0);
+	if (!IS_ERR_OR_NULL(connector_fwnode))
+		acio->connector_fwnode = connector_fwnode;
 
 	acio->rc_res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "rc");
 	acio->rc_base = devm_ioremap_resource(&pdev->dev, acio->rc_res);
